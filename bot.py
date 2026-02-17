@@ -21,7 +21,7 @@ from telegram.ext import (
 import os
 BOT_TOKEN = os.getenv("BOT_TOKEN")   # <-- Replace with your BotFather token
 
-PROTECTION_INTERVAL = 240            # 60 seconds
+PROTECTION_INTERVAL = 240            # 240 seconds
 
 VOUCHER_VALUES = {
     "SVH": 4000,
@@ -351,7 +351,7 @@ async def _start_protection(chat_id, codes, context, reply_to_message=None, edit
         f"🛡️ *Protection Mode Started!*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 Codes: `{len(codes)}`\n"
-        f"⏱ Interval: every *60 seconds*\n"
+        f"⏱ Interval: every *240 seconds*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Running first scan now..."
     )
@@ -543,6 +543,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
-
