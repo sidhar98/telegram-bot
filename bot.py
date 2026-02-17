@@ -18,7 +18,8 @@ from telegram.ext import (
 # ─────────────────────────────────────────
 #   CONFIG  — only change BOT_TOKEN
 # ─────────────────────────────────────────
-BOT_TOKEN = ".."   # <-- Replace with your BotFather token
+import os
+BOT_TOKEN = os.getenv("BOT_TOKEN")   # <-- Replace with your BotFather token
 
 PROTECTION_INTERVAL = 60            # 60 seconds
 
@@ -542,4 +543,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
