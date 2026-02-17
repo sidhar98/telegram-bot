@@ -21,7 +21,7 @@ from telegram.ext import (
 import os
 BOT_TOKEN = os.getenv("BOT_TOKEN")   # <-- Replace with your BotFather token
 
-PROTECTION_INTERVAL = 60            # 60 seconds
+PROTECTION_INTERVAL = 240            # 60 seconds
 
 VOUCHER_VALUES = {
     "SVH": 4000,
@@ -545,3 +545,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
