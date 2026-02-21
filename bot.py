@@ -147,8 +147,12 @@ def _check_voucher(code: str):
             timeout=60,
         )
         try:
-            return r.status_code, r.json()
+            data = r.json()
+            # Log full response so we can debug cookie/IP issues
+            log.info("CHECK %s | status=%s | response=%s", code, r.status_code, json.dumps(data)[:300])
+            return r.status_code, data
         except json.JSONDecodeError:
+            log.warning("CHECK %s | status=%s | non-JSON response: %s", code, r.status_code, r.text[:200])
             return r.status_code, None
     except Exception as e:
         log.warning("Network error %s: %s", code, e)
@@ -171,15 +175,34 @@ def _reset_voucher(code: str):
 def _is_valid(data) -> bool:
     """
     Exact logic from original shein.py:
-      - data is None / empty       → False (network/parse failure)
-      - 'errorMessage' key present → False (voucher dead/used/invalid)
-      - no 'errorMessage' key      → True  (voucher alive and valid)
+      - data is None / empty         → False (network/parse failure)
+      - 'errorMessage' key present   → False (voucher dead/used/invalid)
+      - no 'errorMessage' key        → True  (voucher alive and valid)
+
+    NOTE: If cookies are expired/wrong IP, SHEIN returns an auth error
+    which also has 'errorMessage', so those codes correctly appear dead.
+    Check bot.log to see the raw responses and diagnose cookie issues.
     """
     if not data:
         return False
     if "errorMessage" in data:
         return False
     return True
+
+
+def _is_auth_error(data) -> bool:
+    """Detect if SHEIN returned a session/auth error (cookies expired or wrong IP)."""
+    if not data:
+        return False
+    error_msg = str(data.get("errorMessage", "")).lower()
+    # Common SHEIN auth error messages
+    if any(k in error_msg for k in ["login", "session", "unauthorized", "token", "expired"]):
+        return True
+    # Also check if the response has no recognisable SHEIN fields at all
+    known_keys = {"errorMessage", "info", "code", "cart", "voucher", "discount"}
+    if not any(k in data for k in known_keys):
+        return True
+    return False
 
 
 def _voucher_value(code: str) -> str:
@@ -261,6 +284,10 @@ async def run_scan(bot: Bot, chat_id: int, codes: list, progress_msg_id: int = N
 
         if status is None and data is None:
             errors.append(code)          # network error — keep safe
+        elif _is_auth_error(data):
+            # Cookies expired or wrong IP — warn but don't mark dead
+            errors.append(code)
+            log.error("AUTH ERROR on %s — cookies may be expired or wrong IP: %s", code, data)
         elif _is_valid(data):
             alive.append(code)
         else:
@@ -683,6 +710,23 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Send last 25 lines of bot.log to help diagnose cookie/IP issues."""
+    try:
+        with open("bot.log", "r", encoding="utf-8") as f:
+            log_lines = f.readlines()
+        last = "".join(log_lines[-25:]) if len(log_lines) >= 25 else "".join(log_lines)
+        truncated = last[-3500:]
+        await update.message.reply_text(
+            "\U0001f4cb *Last log entries:*\n" + "```\n" + truncated + "\n```",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except FileNotFoundError:
+        await update.message.reply_text("No log file found yet.")
+    except Exception as e:
+        await update.message.reply_text("Could not read log: " + str(e))
+
+
 async def handle_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     If someone sends a raw message (not a command), treat it as codes to check instantly.
@@ -851,8 +895,9 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────
 
 def main():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Please set your BOT_TOKEN at the top of the script.")
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN environment variable is not set!")
+        print("   On Railway: go to Variables and add BOT_TOKEN=your_token")
         sys.exit(1)
 
     app = (
@@ -876,6 +921,7 @@ def main():
     app.add_handler(CommandHandler("list",    cmd_list))
     app.add_handler(CommandHandler("clear",   cmd_clear))
     app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("debug",   cmd_debug))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(callback_protect, pattern=r"^protect_(one|all):"))
@@ -888,6 +934,9 @@ def main():
     print("====================================================")
     print("🛡️  SHEIN Voucher Bot is running...")
     print("🍪  Cookies loaded from cookies.json")
+    print("⚠️  If running on Railway/VPS: make sure cookies were")
+    print("    exported from the SAME IP/network, or codes may")
+    print("    show as dead. Check bot.log for raw API responses.")
     print("====================================================")
 
     app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
