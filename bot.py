@@ -710,6 +710,40 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_rawcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /rawcheck CODE — shows the EXACT raw JSON response from SHEIN for one code.
+    Use this to diagnose why working codes show as dead.
+    """
+    uid = update.effective_user.id
+
+    codes = _parse_codes(ctx, update.message.text or "")
+    if not codes:
+        await update.message.reply_text(
+            "Usage: `/rawcheck CODE`\nShows raw SHEIN API response for that code.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    code = codes[0]
+    await update.message.reply_text(f"🔬 Sending raw check for `{code}`...", parse_mode=ParseMode.MARKDOWN)
+
+    loop = asyncio.get_event_loop()
+    status, data = await loop.run_in_executor(None, _check_voucher, code)
+    await loop.run_in_executor(None, _reset_voucher, code)
+
+    raw = json.dumps(data, indent=2) if data else "None"
+    is_valid = _is_valid(data)
+
+    msg = (
+        f"🔬 *Raw API response for* `{code}`\n\n"
+        f"HTTP Status: `{status}`\n"
+        f"Bot verdict: `{'✅ ALIVE' if is_valid else '❌ DEAD'}`\n\n"
+        f"*Full response:*\n```\n{raw[:2000]}\n```"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
 async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Send last 25 lines of bot.log to help diagnose cookie/IP issues."""
     try:
@@ -921,7 +955,8 @@ def main():
     app.add_handler(CommandHandler("list",    cmd_list))
     app.add_handler(CommandHandler("clear",   cmd_clear))
     app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("debug",   cmd_debug))
+    app.add_handler(CommandHandler("debug",     cmd_debug))
+    app.add_handler(CommandHandler("rawcheck", cmd_rawcheck))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(callback_protect, pattern=r"^protect_(one|all):"))
