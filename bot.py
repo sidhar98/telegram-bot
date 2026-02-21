@@ -284,10 +284,6 @@ async def run_scan(bot: Bot, chat_id: int, codes: list, progress_msg_id: int = N
 
         if status is None and data is None:
             errors.append(code)          # network error — keep safe
-        elif _is_auth_error(data):
-            # Cookies expired or wrong IP — warn but don't mark dead
-            errors.append(code)
-            log.error("AUTH ERROR on %s — cookies may be expired or wrong IP: %s", code, data)
         elif _is_valid(data):
             alive.append(code)
         else:
