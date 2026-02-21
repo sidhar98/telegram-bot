@@ -174,34 +174,34 @@ def _reset_voucher(code: str):
 
 def _is_valid(data) -> bool:
     """
-    Exact logic from original shein.py:
-      - data is None / empty         → False (network/parse failure)
-      - 'errorMessage' key present   → False (voucher dead/used/invalid)
-      - no 'errorMessage' key        → True  (voucher alive and valid)
+    Determines if a voucher is ALIVE based on SHEIN API error types.
 
-    NOTE: If cookies are expired/wrong IP, SHEIN returns an auth error
-    which also has 'errorMessage', so those codes correctly appear dead.
-    Check bot.log to see the raw responses and diagnose cookie issues.
+    SHEIN error types and what they mean:
+      - No errorMessage at all  → ALIVE (voucher applied successfully)
+      - CartError               → ALIVE (cart empty/not found — code itself is valid)
+      - VoucherOperationError   → DEAD  (voucher used, expired, or invalid)
+      - Any other error type    → DEAD  (treat unknown errors as dead to be safe)
     """
     if not data:
         return False
-    if "errorMessage" in data:
-        return False
-    return True
 
+    if "errorMessage" not in data:
+        return True  # No error at all — code is valid
 
-def _is_auth_error(data) -> bool:
-    """Detect if SHEIN returned a session/auth error (cookies expired or wrong IP)."""
-    if not data:
-        return False
-    error_msg = str(data.get("errorMessage", "")).lower()
-    # Common SHEIN auth error messages
-    if any(k in error_msg for k in ["login", "session", "unauthorized", "token", "expired"]):
-        return True
-    # Also check if the response has no recognisable SHEIN fields at all
-    known_keys = {"errorMessage", "info", "code", "cart", "voucher", "discount"}
-    if not any(k in data for k in known_keys):
-        return True
+    errors = data.get("errorMessage", {}).get("errors", [])
+
+    for error in errors:
+        error_type = error.get("type", "")
+
+        # CartError = empty cart / cart not found — code itself is ALIVE
+        if error_type == "CartError":
+            return True
+
+        # VoucherOperationError = code is dead/used/expired
+        if error_type == "VoucherOperationError":
+            return False
+
+    # Any other error type — treat as dead
     return False
 
 
