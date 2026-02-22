@@ -147,8 +147,12 @@ def _check_voucher(code: str):
             timeout=60,
         )
         try:
-            return r.status_code, r.json()
+            data = r.json()
+            # Log full response so we can debug cookie/IP issues
+            log.info("CHECK %s | status=%s | response=%s", code, r.status_code, json.dumps(data)[:300])
+            return r.status_code, data
         except json.JSONDecodeError:
+            log.warning("CHECK %s | status=%s | non-JSON response: %s", code, r.status_code, r.text[:200])
             return r.status_code, None
     except Exception as e:
         log.warning("Network error %s: %s", code, e)
@@ -170,16 +174,35 @@ def _reset_voucher(code: str):
 
 def _is_valid(data) -> bool:
     """
-    Exact logic from original shein.py:
-      - data is None / empty       → False (network/parse failure)
-      - 'errorMessage' key present → False (voucher dead/used/invalid)
-      - no 'errorMessage' key      → True  (voucher alive and valid)
+    Determines if a voucher is ALIVE based on SHEIN API error types.
+
+    SHEIN error types and what they mean:
+      - No errorMessage at all  → ALIVE (voucher applied successfully)
+      - CartError               → ALIVE (cart empty/not found — code itself is valid)
+      - VoucherOperationError   → DEAD  (voucher used, expired, or invalid)
+      - Any other error type    → DEAD  (treat unknown errors as dead to be safe)
     """
     if not data:
         return False
-    if "errorMessage" in data:
-        return False
-    return True
+
+    if "errorMessage" not in data:
+        return True  # No error at all — code is valid
+
+    errors = data.get("errorMessage", {}).get("errors", [])
+
+    for error in errors:
+        error_type = error.get("type", "")
+
+        # CartError = empty cart / cart not found — code itself is ALIVE
+        if error_type == "CartError":
+            return True
+
+        # VoucherOperationError = code is dead/used/expired
+        if error_type == "VoucherOperationError":
+            return False
+
+    # Any other error type — treat as dead
+    return False
 
 
 def _voucher_value(code: str) -> str:
@@ -683,6 +706,57 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_rawcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /rawcheck CODE — shows the EXACT raw JSON response from SHEIN for one code.
+    Use this to diagnose why working codes show as dead.
+    """
+    uid = update.effective_user.id
+
+    codes = _parse_codes(ctx, update.message.text or "")
+    if not codes:
+        await update.message.reply_text(
+            "Usage: `/rawcheck CODE`\nShows raw SHEIN API response for that code.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    code = codes[0]
+    await update.message.reply_text(f"🔬 Sending raw check for `{code}`...", parse_mode=ParseMode.MARKDOWN)
+
+    loop = asyncio.get_event_loop()
+    status, data = await loop.run_in_executor(None, _check_voucher, code)
+    await loop.run_in_executor(None, _reset_voucher, code)
+
+    raw = json.dumps(data, indent=2) if data else "None"
+    is_valid = _is_valid(data)
+
+    msg = (
+        f"🔬 *Raw API response for* `{code}`\n\n"
+        f"HTTP Status: `{status}`\n"
+        f"Bot verdict: `{'✅ ALIVE' if is_valid else '❌ DEAD'}`\n\n"
+        f"*Full response:*\n```\n{raw[:2000]}\n```"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Send last 25 lines of bot.log to help diagnose cookie/IP issues."""
+    try:
+        with open("bot.log", "r", encoding="utf-8") as f:
+            log_lines = f.readlines()
+        last = "".join(log_lines[-25:]) if len(log_lines) >= 25 else "".join(log_lines)
+        truncated = last[-3500:]
+        await update.message.reply_text(
+            "\U0001f4cb *Last log entries:*\n" + "```\n" + truncated + "\n```",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except FileNotFoundError:
+        await update.message.reply_text("No log file found yet.")
+    except Exception as e:
+        await update.message.reply_text("Could not read log: " + str(e))
+
+
 async def handle_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     If someone sends a raw message (not a command), treat it as codes to check instantly.
@@ -851,8 +925,9 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────
 
 def main():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Please set your BOT_TOKEN at the top of the script.")
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN environment variable is not set!")
+        print("   On Railway: go to Variables and add BOT_TOKEN=your_token")
         sys.exit(1)
 
     app = (
@@ -876,6 +951,8 @@ def main():
     app.add_handler(CommandHandler("list",    cmd_list))
     app.add_handler(CommandHandler("clear",   cmd_clear))
     app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("debug",     cmd_debug))
+    app.add_handler(CommandHandler("rawcheck", cmd_rawcheck))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(callback_protect, pattern=r"^protect_(one|all):"))
@@ -888,6 +965,9 @@ def main():
     print("====================================================")
     print("🛡️  SHEIN Voucher Bot is running...")
     print("🍪  Cookies loaded from cookies.json")
+    print("⚠️  If running on Railway/VPS: make sure cookies were")
+    print("    exported from the SAME IP/network, or codes may")
+    print("    show as dead. Check bot.log for raw API responses.")
     print("====================================================")
 
     app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
