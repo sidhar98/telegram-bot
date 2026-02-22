@@ -1,5 +1,6 @@
 """
 SHEIN Voucher Checker + Protector — Telegram Bot
+Version: 3.0 — Button fix + Cart logic
 
 SETUP:
   1. Put cookies.json in the SAME folder as this script
@@ -968,7 +969,7 @@ def main():
     app.add_error_handler(error_handler)
 
     print("====================================================")
-    print("🛡️  SHEIN Voucher Bot is running...")
+    print("🛡️  SHEIN Voucher Bot is running... v3.0")
     print("🍪  Cookies loaded from cookies.json")
     print("⚠️  If running on Railway/VPS: make sure cookies were")
     print("    exported from the SAME IP/network, or codes may")
