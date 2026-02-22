@@ -1,6 +1,5 @@
 """
 SHEIN Voucher Checker + Protector — Telegram Bot
-Version: 3.0 — Button fix + Cart logic
 
 SETUP:
   1. Put cookies.json in the SAME folder as this script
@@ -148,12 +147,8 @@ def _check_voucher(code: str):
             timeout=60,
         )
         try:
-            data = r.json()
-            # Log full response so we can debug cookie/IP issues
-            log.info("CHECK %s | status=%s | response=%s", code, r.status_code, json.dumps(data)[:300])
-            return r.status_code, data
+            return r.status_code, r.json()
         except json.JSONDecodeError:
-            log.warning("CHECK %s | status=%s | non-JSON response: %s", code, r.status_code, r.text[:200])
             return r.status_code, None
     except Exception as e:
         log.warning("Network error %s: %s", code, e)
@@ -173,27 +168,17 @@ def _reset_voucher(code: str):
         pass
 
 
-
 def _is_valid(data) -> bool:
     """
-    Exact logic from original shein.py is_voucher_applicable().
-    Requires at least one item in the cart to work correctly.
-
-      - No errorMessage                              → ALIVE
-      - VoucherOperationError + "not applicable"     → DEAD (wrong category/order)
-      - Any other errorMessage                       → DEAD
+    Exact logic from original shein.py:
+      - data is None / empty       → False (network/parse failure)
+      - 'errorMessage' key present → False (voucher dead/used/invalid)
+      - no 'errorMessage' key      → True  (voucher alive and valid)
     """
     if not data:
         return False
-
     if "errorMessage" in data:
-        errors = data.get("errorMessage", {}).get("errors", [])
-        for error in errors:
-            if error.get("type") == "VoucherOperationError":
-                if "not applicable" in error.get("message", "").lower():
-                    return False
         return False
-
     return True
 
 
@@ -245,7 +230,6 @@ async def run_scan(bot: Bot, chat_id: int, codes: list, progress_msg_id: int = N
     last_text = [""]
     loop = asyncio.get_event_loop()
 
-
     async def update_progress(done: int, current: str):
         if total == 0 or not progress_msg_id:
             return
@@ -286,7 +270,6 @@ async def run_scan(bot: Bot, chat_id: int, codes: list, progress_msg_id: int = N
         await asyncio.sleep(CODE_CHECK_DELAY)
 
     await update_progress(total, "✅ Done")
-
     return alive, dead, errors
 
 
@@ -536,32 +519,30 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result_text = "\n".join(lines)
 
     if alive:
-        # Store alive codes in session so callback_data stays short (Telegram 64 byte limit)
-        session_id = f"{uid}_{int(datetime.datetime.now().timestamp())}"
-        pending_protect[session_id] = alive[:]
-
+        # Build one button per alive code to protect it individually
         keyboard = []
-        # Protect All button (uses session_id, stays short)
-        if len(alive) > 1:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🔒 Protect All {len(alive)} Working Codes",
-                    callback_data=f"pa:{uid}:{session_id}"
-                )
-            ])
-        # Individual buttons per code
         for c in alive:
             keyboard.append([
                 InlineKeyboardButton(
                     f"🔒 Protect {c}",
-                    callback_data=f"po:{uid}:{c}"
+                    callback_data=f"protect_one:{uid}:{c}"
                 )
             ])
+        # Also offer a "protect all" button if more than one alive
+        if len(alive) > 1:
+            all_codes = ",".join(alive)
+            keyboard.insert(0, [
+                InlineKeyboardButton(
+                    f"🔒 Protect All {len(alive)} Working Codes",
+                    callback_data=f"protect_all:{uid}:{all_codes}"
+                )
+            ])
+        reply_markup = InlineKeyboardMarkup(keyboard)
         await ctx.bot.send_message(
             chat_id=update.effective_chat.id,
             text=result_text,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=reply_markup,
         )
     else:
         await safe_send(ctx.bot, update.effective_chat.id, result_text, parse_mode=ParseMode.MARKDOWN)
@@ -702,57 +683,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_rawcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /rawcheck CODE — shows the EXACT raw JSON response from SHEIN for one code.
-    Use this to diagnose why working codes show as dead.
-    """
-    uid = update.effective_user.id
-
-    codes = _parse_codes(ctx, update.message.text or "")
-    if not codes:
-        await update.message.reply_text(
-            "Usage: `/rawcheck CODE`\nShows raw SHEIN API response for that code.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    code = codes[0]
-    await update.message.reply_text(f"🔬 Sending raw check for `{code}`...", parse_mode=ParseMode.MARKDOWN)
-
-    loop = asyncio.get_event_loop()
-    status, data = await loop.run_in_executor(None, _check_voucher, code)
-    await loop.run_in_executor(None, _reset_voucher, code)
-
-    raw = json.dumps(data, indent=2) if data else "None"
-    is_valid = _is_valid(data)
-
-    msg = (
-        f"🔬 *Raw API response for* `{code}`\n\n"
-        f"HTTP Status: `{status}`\n"
-        f"Bot verdict: `{'✅ ALIVE' if is_valid else '❌ DEAD'}`\n\n"
-        f"*Full response:*\n```\n{raw[:2000]}\n```"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Send last 25 lines of bot.log to help diagnose cookie/IP issues."""
-    try:
-        with open("bot.log", "r", encoding="utf-8") as f:
-            log_lines = f.readlines()
-        last = "".join(log_lines[-25:]) if len(log_lines) >= 25 else "".join(log_lines)
-        truncated = last[-3500:]
-        await update.message.reply_text(
-            "\U0001f4cb *Last log entries:*\n" + "```\n" + truncated + "\n```",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except FileNotFoundError:
-        await update.message.reply_text("No log file found yet.")
-    except Exception as e:
-        await update.message.reply_text("Could not read log: " + str(e))
-
-
 async def handle_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     If someone sends a raw message (not a command), treat it as codes to check instantly.
@@ -809,22 +739,20 @@ async def handle_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result_text = "\n".join(lines)
 
     if alive:
-        session_id = f"{uid}_{int(datetime.datetime.now().timestamp())}"
-        pending_protect[session_id] = alive[:]
-
         keyboard = []
-        if len(alive) > 1:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🔒 Protect All {len(alive)} Working Codes",
-                    callback_data=f"pa:{uid}:{session_id}"
-                )
-            ])
         for c in alive:
             keyboard.append([
                 InlineKeyboardButton(
                     f"🔒 Protect {c}",
-                    callback_data=f"po:{uid}:{c}"
+                    callback_data=f"protect_one:{uid}:{c}"
+                )
+            ])
+        if len(alive) > 1:
+            all_codes = ",".join(alive)
+            keyboard.insert(0, [
+                InlineKeyboardButton(
+                    f"🔒 Protect All {len(alive)} Working Codes",
+                    callback_data=f"protect_all:{uid}:{all_codes}"
                 )
             ])
         await ctx.bot.send_message(
@@ -844,26 +772,18 @@ async def handle_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def callback_protect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handles the inline 🔒 Protect button taps from /check results."""
     query = update.callback_query
-    await query.answer()
+    await query.answer()  # remove the loading spinner
 
-    data = query.data
+    data = query.data  # e.g. "protect_one:12345:SVC1234" or "protect_all:12345:SVC1,SVH2"
     parts = data.split(":", 2)
     if len(parts) < 3:
         return
 
-    action, uid_str, payload = parts
+    action, uid_str, codes_str = parts
     uid = int(uid_str)
     s = S(uid)
 
-    # pa = protect all (payload is session_id), po = protect one (payload is code)
-    if action == "pa":
-        session_id = payload
-        codes_to_add = pending_protect.pop(session_id, [])
-        if not codes_to_add:
-            await query.answer("Session expired, please run check again.", show_alert=True)
-            return
-    else:  # po = protect one
-        codes_to_add = [payload.strip().upper()]
+    codes_to_add = [c.strip().upper() for c in codes_str.split(",") if c.strip()]
 
     added, skipped = [], []
     for code in codes_to_add:
@@ -931,9 +851,8 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────
 
 def main():
-    if not BOT_TOKEN:
-        print("❌ BOT_TOKEN environment variable is not set!")
-        print("   On Railway: go to Variables and add BOT_TOKEN=your_token")
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ Please set your BOT_TOKEN at the top of the script.")
         sys.exit(1)
 
     app = (
@@ -957,11 +876,9 @@ def main():
     app.add_handler(CommandHandler("list",    cmd_list))
     app.add_handler(CommandHandler("clear",   cmd_clear))
     app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("debug",     cmd_debug))
-    app.add_handler(CommandHandler("rawcheck", cmd_rawcheck))
 
     # Inline button callbacks
-    app.add_handler(CallbackQueryHandler(callback_protect, pattern=r"^(pa|po):"))
+    app.add_handler(CallbackQueryHandler(callback_protect, pattern=r"^protect_(one|all):"))
 
     # Handle plain text messages as instant voucher checks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
@@ -969,11 +886,8 @@ def main():
     app.add_error_handler(error_handler)
 
     print("====================================================")
-    print("🛡️  SHEIN Voucher Bot is running... v3.0")
+    print("🛡️  SHEIN Voucher Bot is running...")
     print("🍪  Cookies loaded from cookies.json")
-    print("⚠️  If running on Railway/VPS: make sure cookies were")
-    print("    exported from the SAME IP/network, or codes may")
-    print("    show as dead. Check bot.log for raw API responses.")
     print("====================================================")
 
     app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
