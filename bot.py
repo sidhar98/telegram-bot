@@ -172,37 +172,28 @@ def _reset_voucher(code: str):
         pass
 
 
+
 def _is_valid(data) -> bool:
     """
-    Determines if a voucher is ALIVE based on SHEIN API error types.
+    Exact logic from original shein.py is_voucher_applicable().
+    Requires at least one item in the cart to work correctly.
 
-    SHEIN error types and what they mean:
-      - No errorMessage at all  → ALIVE (voucher applied successfully)
-      - CartError               → ALIVE (cart empty/not found — code itself is valid)
-      - VoucherOperationError   → DEAD  (voucher used, expired, or invalid)
-      - Any other error type    → DEAD  (treat unknown errors as dead to be safe)
+      - No errorMessage                              → ALIVE
+      - VoucherOperationError + "not applicable"     → DEAD (wrong category/order)
+      - Any other errorMessage                       → DEAD
     """
     if not data:
         return False
 
-    if "errorMessage" not in data:
-        return True  # No error at all — code is valid
+    if "errorMessage" in data:
+        errors = data.get("errorMessage", {}).get("errors", [])
+        for error in errors:
+            if error.get("type") == "VoucherOperationError":
+                if "not applicable" in error.get("message", "").lower():
+                    return False
+        return False
 
-    errors = data.get("errorMessage", {}).get("errors", [])
-
-    for error in errors:
-        error_type = error.get("type", "")
-
-        # CartError = empty cart / cart not found — code itself is ALIVE
-        if error_type == "CartError":
-            return True
-
-        # VoucherOperationError = code is dead/used/expired
-        if error_type == "VoucherOperationError":
-            return False
-
-    # Any other error type — treat as dead
-    return False
+    return True
 
 
 def _voucher_value(code: str) -> str:
@@ -253,6 +244,7 @@ async def run_scan(bot: Bot, chat_id: int, codes: list, progress_msg_id: int = N
     last_text = [""]
     loop = asyncio.get_event_loop()
 
+
     async def update_progress(done: int, current: str):
         if total == 0 or not progress_msg_id:
             return
@@ -293,6 +285,7 @@ async def run_scan(bot: Bot, chat_id: int, codes: list, progress_msg_id: int = N
         await asyncio.sleep(CODE_CHECK_DELAY)
 
     await update_progress(total, "✅ Done")
+
     return alive, dead, errors
 
 
@@ -542,30 +535,32 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result_text = "\n".join(lines)
 
     if alive:
-        # Build one button per alive code to protect it individually
+        # Store alive codes in session so callback_data stays short (Telegram 64 byte limit)
+        session_id = f"{uid}_{int(datetime.datetime.now().timestamp())}"
+        pending_protect[session_id] = alive[:]
+
         keyboard = []
+        # Protect All button (uses session_id, stays short)
+        if len(alive) > 1:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🔒 Protect All {len(alive)} Working Codes",
+                    callback_data=f"pa:{uid}:{session_id}"
+                )
+            ])
+        # Individual buttons per code
         for c in alive:
             keyboard.append([
                 InlineKeyboardButton(
                     f"🔒 Protect {c}",
-                    callback_data=f"protect_one:{uid}:{c}"
+                    callback_data=f"po:{uid}:{c}"
                 )
             ])
-        # Also offer a "protect all" button if more than one alive
-        if len(alive) > 1:
-            all_codes = ",".join(alive)
-            keyboard.insert(0, [
-                InlineKeyboardButton(
-                    f"🔒 Protect All {len(alive)} Working Codes",
-                    callback_data=f"protect_all:{uid}:{all_codes}"
-                )
-            ])
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await ctx.bot.send_message(
             chat_id=update.effective_chat.id,
             text=result_text,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup,
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
     else:
         await safe_send(ctx.bot, update.effective_chat.id, result_text, parse_mode=ParseMode.MARKDOWN)
@@ -813,20 +808,22 @@ async def handle_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result_text = "\n".join(lines)
 
     if alive:
+        session_id = f"{uid}_{int(datetime.datetime.now().timestamp())}"
+        pending_protect[session_id] = alive[:]
+
         keyboard = []
+        if len(alive) > 1:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🔒 Protect All {len(alive)} Working Codes",
+                    callback_data=f"pa:{uid}:{session_id}"
+                )
+            ])
         for c in alive:
             keyboard.append([
                 InlineKeyboardButton(
                     f"🔒 Protect {c}",
-                    callback_data=f"protect_one:{uid}:{c}"
-                )
-            ])
-        if len(alive) > 1:
-            all_codes = ",".join(alive)
-            keyboard.insert(0, [
-                InlineKeyboardButton(
-                    f"🔒 Protect All {len(alive)} Working Codes",
-                    callback_data=f"protect_all:{uid}:{all_codes}"
+                    callback_data=f"po:{uid}:{c}"
                 )
             ])
         await ctx.bot.send_message(
@@ -846,18 +843,26 @@ async def handle_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def callback_protect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handles the inline 🔒 Protect button taps from /check results."""
     query = update.callback_query
-    await query.answer()  # remove the loading spinner
+    await query.answer()
 
-    data = query.data  # e.g. "protect_one:12345:SVC1234" or "protect_all:12345:SVC1,SVH2"
+    data = query.data
     parts = data.split(":", 2)
     if len(parts) < 3:
         return
 
-    action, uid_str, codes_str = parts
+    action, uid_str, payload = parts
     uid = int(uid_str)
     s = S(uid)
 
-    codes_to_add = [c.strip().upper() for c in codes_str.split(",") if c.strip()]
+    # pa = protect all (payload is session_id), po = protect one (payload is code)
+    if action == "pa":
+        session_id = payload
+        codes_to_add = pending_protect.pop(session_id, [])
+        if not codes_to_add:
+            await query.answer("Session expired, please run check again.", show_alert=True)
+            return
+    else:  # po = protect one
+        codes_to_add = [payload.strip().upper()]
 
     added, skipped = [], []
     for code in codes_to_add:
@@ -955,7 +960,7 @@ def main():
     app.add_handler(CommandHandler("rawcheck", cmd_rawcheck))
 
     # Inline button callbacks
-    app.add_handler(CallbackQueryHandler(callback_protect, pattern=r"^protect_(one|all):"))
+    app.add_handler(CallbackQueryHandler(callback_protect, pattern=r"^(pa|po):"))
 
     # Handle plain text messages as instant voucher checks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
