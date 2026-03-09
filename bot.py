@@ -16,7 +16,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-
 # ===================== CONFIGURATION =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # <-- Replace with your Telegram bot token
 
@@ -428,5 +427,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
