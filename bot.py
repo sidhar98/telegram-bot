@@ -409,6 +409,9 @@ async def post_init(application: Application):
     pass  # reserved for future startup tasks
 
 def main():
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -427,3 +430,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
