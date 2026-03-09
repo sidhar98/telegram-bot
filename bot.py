@@ -1,897 +1,429 @@
-"""
-SHEIN Voucher Checker + Protector — Telegram Bot
-
-SETUP:
-  1. Put cookies.json in the SAME folder as this script
-  2. Set BOT_TOKEN below (get from @BotFather on Telegram)
-  3. pip install python-telegram-bot requests
-  4. python shein_bot.py
-"""
-
+from telegram.ext 
+import JobQueue
 import json
 import requests
+import re
 import os
-import datetime
+import time
+import threading
 import asyncio
-import logging
-import sys
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler,
-    MessageHandler, CallbackQueryHandler, ContextTypes, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
 )
-from telegram.constants import ParseMode
-from telegram.error import TelegramError
 
-# ──────────────────────────────────────────────────────
-#  CONFIGURATION — only edit this section
-# ──────────────────────────────────────────────────────
+# ===================== CONFIGURATION =====================
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # <-- Replace with your Telegram bot token
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")   # from @BotFather on Telegram
+MAX_WORKERS = 8          # Number of vouchers to check at once
+THREAD_DELAY = 0.3       # Delay between starting threads
+RETRY_DELAY = 0.5        # Delay before retrying a failed request
+CHECK_INTERVAL = 240     # Seconds between cycles (auto-protect loop — 4 minutes)
 
-# Known voucher value prefixes — add more if needed
-VOUCHER_VALUES = {
-    "SVH": 4000,
-    "SV3": 5000,
-    "SVC": 1000,
-    "SVD": 2000,
-    "SVA": 500,
-    "SVG": 500,
-}
+# Thread locks
+proxy_lock = threading.Lock()
 
-# Wait between full scan cycles (3 minutes)
-INTERVAL_SECONDS = 180
+# Per-user protected codes: { user_id (int) -> [code, ...] }
+protected_codes: dict[int, list[str]] = {}
+protect_lock = threading.Lock()
 
-# Delay between each individual code check
-# 1.5s = best balance of speed vs rate-limit safety
-# 50 codes ≈ 75s | 60 codes ≈ 90s | full cycle ≈ 4.5 min
-CODE_CHECK_DELAY = 1.5
+# Scheduled chats tracker
+_scheduled_chats: set = set()
+_scheduled_lock = threading.Lock()
 
-# ──────────────────────────────────────────────────────
-#  LOGGING
-# ──────────────────────────────────────────────────────
+# ===================== TIMESTAMP HELPER =====================
+def current_timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger(__name__)
+# ===================== STARTUP LOGGER =====================
+def _startup_log(msg: str) -> None:
+    """Single entry-point for essential startup messages printed to console."""
+    print(msg)
 
-# ──────────────────────────────────────────────────────
-#  COOKIES — auto-loaded from cookies.json at startup
-# ──────────────────────────────────────────────────────
+# ===================== PROXY MANAGER =====================
+class ProxyRotator:
+    def __init__(self, proxy_file="proxies.txt"):
+        self.proxies = []
+        self.index = 0
+        self.load_proxies(proxy_file)
 
-def load_cookies() -> str:
-    path = "cookies.json"
-    if not os.path.exists(path):
-        print(f"❌ cookies.json not found at: {path}")
-        print("   Place cookies.json in the same folder as shein_bot.py and restart.")
-        sys.exit(1)
+    def load_proxies(self, filename):
+        """Load proxies from file, each line format: username:password@host:port"""
+        if not os.path.exists(filename):
+            return  # no proxy file — continue without proxies
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or '@' not in line:
+                    continue
+                try:
+                    creds, hostport = line.split('@', 1)
+                    if ':' in creds:
+                        username, password = creds.split(':', 1)
+                    else:
+                        username = creds
+                        password = ""
+                    if ':' in hostport:
+                        host, port = hostport.split(':', 1)
+                    else:
+                        host = hostport
+                        port = "80"
+                    proxy_url = f"http://{username}:{password}@{host}:{port}"
+                    self.proxies.append({
+                        "http": proxy_url,
+                        "https": proxy_url
+                    })
+                except Exception:
+                    pass  # skip malformed proxy lines silently
+        _startup_log(f"Loaded {len(self.proxies)} proxies.")
+
+    def get_next_proxy(self):
+        """Return the next proxy dict for a new cycle, rotating round-robin."""
+        with proxy_lock:
+            if not self.proxies:
+                return None
+            proxy = self.proxies[self.index]
+            self.index = (self.index + 1) % len(self.proxies)
+            return proxy
+
+# ===================== SHEIN LOGIC =====================
+def load_cookies():
+    if not os.path.exists("cookies.json"):
+        return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open("cookies.json", "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return "; ".join(
-                f"{i['name']}={i['value']}" for i in data
-                if isinstance(i, dict) and "name" in i and "value" in i
-            )
-        if isinstance(data, dict):
-            return "; ".join(f"{k}={v}" for k, v in data.items())
-    except Exception as e:
-        print(f"❌ Error reading cookies.json: {e}")
-        sys.exit(1)
-    print("❌ cookies.json format not recognised.")
-    sys.exit(1)
-
-
-COOKIE_STRING = load_cookies()
-
-# ──────────────────────────────────────────────────────
-#  PER-USER STATE
-# ──────────────────────────────────────────────────────
-
-state: dict = defaultdict(lambda: {
-    "vouchers": {},       # { "CODE": {"paused": bool} }
-    "protect_task": None,
-    "checking": False,
-    "stop_requested": False,
-})
-
-
-
-def S(uid: int) -> dict:
-    return state[uid]
-
-# ──────────────────────────────────────────────────────
-#  SHEIN API  (exact logic from original shein.py)
-# ──────────────────────────────────────────────────────
-
-def _headers() -> dict:
-    return {
-        "accept": "application/json",
-        "accept-encoding": "gzip, deflate, br, zstd",
-        "accept-language": "en-US,en;q=0.9",
-        "cache-control": "no-cache",
-        "content-type": "application/json",
-        "origin": "https://www.sheinindia.in",
-        "pragma": "no-cache",
-        "referer": "https://www.sheinindia.in/cart",
-        "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
-        "sec-ch-ua-mobile": "?1",
-        "sec-ch-ua-platform": '"Android"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": (
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-        ),
-        "x-tenant-id": "SHEIN",
-        "cookie": COOKIE_STRING,
-    }
-
-
-def _check_voucher(code: str):
-    """Returns (status_code, json_data) or (None, None) on network error."""
-    try:
-        r = requests.post(
-            "https://www.sheinindia.in/api/cart/apply-voucher",
-            json={"voucherId": code, "device": {"client_type": "mobile_web"}},
-            headers=_headers(),
-            timeout=60,
-        )
-        try:
-            return r.status_code, r.json()
-        except json.JSONDecodeError:
-            return r.status_code, None
-    except Exception as e:
-        log.warning("Network error %s: %s", code, e)
-        return None, None
-
-
-def _reset_voucher(code: str):
-    """Removes code from cart after checking — keeps cart clean."""
-    try:
-        requests.post(
-            "https://www.sheinindia.in/api/cart/reset-voucher",
-            json={"voucherId": code, "device": {"client_type": "mobile_web"}},
-            headers=_headers(),
-            timeout=30,
-        )
+            return "; ".join(f"{c['name']}={c['value']}" for c in data if "name" in c and "value" in c)
+        return None
     except Exception:
-        pass
+        return None
 
-
-def _is_valid(data) -> bool:
+# ===================== LIVE PROGRESS STATE =====================
+class ScanState:
     """
-    Exact logic from original shein.py:
-      - data is None / empty       → False (network/parse failure)
-      - 'errorMessage' key present → False (voucher dead/used/invalid)
-      - no 'errorMessage' key      → True  (voucher alive and valid)
+    Shared mutable state for one scanning cycle.
+    Worker threads write into this; the async progress-editor reads from it.
+    All fields accessed from threads are protected by a lock.
     """
-    if not data:
-        return False
-    if "errorMessage" in data:
-        return False
-    return True
+    def __init__(self, total: int):
+        self.lock = threading.Lock()
+        self.total = total
+        self.checked = 0
+        self.current_code = ""
+        self.valid = 0
+        self.invalid = 0
+        self.errors = 0
+        self.result_lines: list[str] = []   # ordered result strings for final message
+        self.done = False                    # set True when all threads finish
 
-
-def _voucher_value(code: str) -> str:
-    """
-    Returns rupee value string for a code.
-    Checks all known prefixes against the code (not just first 3 chars)
-    because some codes have longer prefixes like SVI, SVIB, etc.
-    Falls back to 'Unknown' if no prefix matches.
-    """
-    upper = code.upper()
-    for prefix, value in VOUCHER_VALUES.items():
-        if upper.startswith(prefix):
-            return str(value)
-    return "Unknown"
-
-
-# ──────────────────────────────────────────────────────
-#  SAFE SEND  (retries on flood / network errors)
-# ──────────────────────────────────────────────────────
-
-async def safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
-    for attempt in range(3):
-        try:
-            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-            return
-        except TelegramError as e:
-            if "flood" in str(e).lower():
-                await asyncio.sleep(5 * (attempt + 1))
+    def record(self, code: str, status: str, line: str):
+        with self.lock:
+            self.checked += 1
+            self.current_code = code
+            if status == "valid":
+                self.valid += 1
+            elif status == "invalid":
+                self.invalid += 1
             else:
-                log.error("Send error attempt %d: %s", attempt + 1, e)
-                await asyncio.sleep(2)
-    log.error("Failed to send to %s after 3 attempts", chat_id)
+                self.errors += 1
+            self.result_lines.append(line)
 
+    def snapshot(self):
+        with self.lock:
+            return (
+                self.checked,
+                self.total,
+                self.valid,
+                self.invalid,
+                self.errors,
+                self.current_code,
+                self.done,
+                list(self.result_lines),
+            )
 
-# ──────────────────────────────────────────────────────
-#  CORE SCAN ENGINE
-# ──────────────────────────────────────────────────────
+# ===================== MESSAGE BUILDERS =====================
+def build_progress_bar(checked: int, total: int, width: int = 19) -> str:
+    pct = checked / total if total else 0
+    filled = round(pct * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}]"
 
-async def run_scan(bot: Bot, chat_id: int, codes: list, progress_msg_id: int = None) -> tuple:
+def build_progress_message(checked, total, valid, invalid, errors, current_code) -> str:
+    pct = int(checked / total * 100) if total else 0
+    bar = build_progress_bar(checked, total)
+    return (
+        f"⚙️ Scanning... {pct}%\n"
+        f"{bar}\n"
+        f"Checked: {checked}/{total}\n"
+        f"✅ Valid: {valid}  ❌ Invalid: {invalid}  ⚠️ Errors: {errors}\n"
+        f"Current: {current_code}"
+    )
+
+def build_final_message(result_lines: list[str], valid, invalid, errors, total) -> str:
+    results_block = "\n".join(result_lines) if result_lines else "(no results)"
+    summary = (
+        "============================\n"
+        "✅ CYCLE COMPLETE — SUMMARY\n"
+        f"🟢 Valid   : {valid}\n"
+        f"🔴 Invalid : {invalid}\n"
+        f"⚠️ Errors  : {errors}\n"
+        f"📦 Total   : {total}"
+    )
+    return f"{results_block}\n\n{summary}"
+
+# ===================== VOUCHER TASK (LOGIC UNCHANGED) =====================
+def check_voucher_task(code, cookie_string, session, proxy, state: ScanState):
     """
-    Scans codes, updates progress bar live, returns (alive, dead, errors).
-      alive  = API confirmed valid
-      dead   = API confirmed dead/used
-      errors = network failure — kept safe, never removed
+    Check a voucher with exactly one retry on technical errors.
+    Records result into ScanState — no direct Telegram calls from this thread.
+    All voucher / API / retry / proxy logic is identical to the original script.
     """
-    alive, dead, errors = [], [], []
-    total = len(codes)
-    last_text = [""]
+    url = "https://www.sheinindia.in/api/cart/apply-voucher"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "x-tenant-id": "SHEIN",
+        "cookie": cookie_string
+    }
+    payload = {"voucherId": code, "device": {"client_type": "web"}}
+
+    for attempt in range(2):  # attempt 0 = first try, 1 = retry
+        try:
+            r = session.post(url, json=payload, headers=headers, timeout=10, proxies=proxy)
+            response = r.json()
+
+            # Business response – no retry needed
+            if "errorMessage" not in response:
+                line = f"🟢 Working: {code}"
+                state.record(code, "valid", line)
+                return
+            else:
+                error_msg = response.get("errorMessage", "Unknown error")
+                already_redeemed_keywords = ["already redeemed", "already been redeemed"]
+                if any(kw in str(error_msg).lower() for kw in already_redeemed_keywords):
+                    line = f"🟡 Already Redeemed: {code} — {error_msg}"
+                else:
+                    line = f"🔴 Not Applicable: {code} — {error_msg}"
+                state.record(code, "invalid", line)
+                return
+
+        except Exception as e:
+            if attempt == 0:
+                # First failure – wait and retry once
+                time.sleep(RETRY_DELAY)
+                continue
+            else:
+                # Second failure – record error
+                line = f"⚠️ Error: {code} — {type(e).__name__}: {e}"
+                state.record(code, "error", line)
+                return
+
+# ===================== HELPERS =====================
+def get_codes_from_text(text: str) -> list[str]:
+    """Extract unique SV... voucher codes from any text."""
+    codes = re.findall(r'\bSV\w+', text)
+    return list(dict.fromkeys(codes))
+
+# ===================== CYCLE RUNNER =====================
+async def run_cycle(codes: list[str], chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Run a full checking cycle.
+      1. Send ONE progress message.
+      2. Edit it live every 1.5 s while worker threads run.
+      3. Replace it with the complete results + summary when done.
+    No extra messages are sent during scanning.
+    """
+    bot = context.bot
+
+    cookie_string = load_cookies()
+    if not cookie_string:
+        await bot.send_message(chat_id=chat_id, text="❌ No valid cookies found. Please add cookies.json.")
+        return
+
+    proxy_rotator = ProxyRotator()
+    proxy = proxy_rotator.get_next_proxy()
+    session = requests.Session()
+    state = ScanState(total=len(codes))
+
+    # ── Send the single progress message ──────────────────────────────────────
+    init_text = build_progress_message(0, len(codes), 0, 0, 0, "—")
+    sent = await bot.send_message(chat_id=chat_id, text=init_text)
+    msg_id = sent.message_id
+
+    # ── Launch thread pool without blocking the event loop ────────────────────
     loop = asyncio.get_event_loop()
 
-    async def update_progress(done: int, current: str):
-        if total == 0 or not progress_msg_id:
-            return
-        pct = int(done / total * 100)
-        bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-        text = (
-            f"⚙️ *Scanning... {pct}%*\n"
-            f"`[{bar}]`\n"
-            f"Checked: `{done}/{total}`\n"
-            f"✅ Alive: `{len(alive)}`  ❌ Dead: `{len(dead)}`\n"
-            f"Current: `{current}`"
-        )
-        if text == last_text[0]:
-            return
-        last_text[0] = text
+    def run_threads():
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for code in codes:
+                executor.submit(check_voucher_task, code, cookie_string, session, proxy, state)
+                time.sleep(THREAD_DELAY)
+        with state.lock:
+            state.done = True
+
+    thread_future = loop.run_in_executor(None, run_threads)
+
+    # ── Live-edit loop ─────────────────────────────────────────────────────────
+    last_text = init_text
+    while True:
+        await asyncio.sleep(1.5)          # stay well within Telegram's 30 edits/min limit
+        checked, total, valid, invalid, errors, current_code, done, _ = state.snapshot()
+        new_text = build_progress_message(checked, total, valid, invalid, errors, current_code or "—")
+        if new_text != last_text:
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=new_text)
+                last_text = new_text
+            except Exception:
+                pass  # edit may fail if message content is identical; safe to ignore
+        if done:
+            break
+
+    # Wait for thread pool to flush completely
+    await thread_future
+
+    # ── Replace progress message with final results + summary ─────────────────
+    checked, total, valid, invalid, errors, _, _, result_lines = state.snapshot()
+    final_text = build_final_message(result_lines, valid, invalid, errors, total)
+
+    MAX_TG = 4096
+    if len(final_text) <= MAX_TG:
+        # Everything fits in one edit
         try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=progress_msg_id,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except TelegramError:
-            pass
-
-    for idx, code in enumerate(codes, 1):
-        await update_progress(idx - 1, code)
-        status, data = await loop.run_in_executor(None, _check_voucher, code)
-
-        if status is None and data is None:
-            errors.append(code)          # network error — keep safe
-        elif _is_valid(data):
-            alive.append(code)
-        else:
-            dead.append(code)
-
-        await loop.run_in_executor(None, _reset_voucher, code)
-        await asyncio.sleep(CODE_CHECK_DELAY)
-
-    await update_progress(total, "✅ Done")
-    return alive, dead, errors
-
-
-# ──────────────────────────────────────────────────────
-#  PROTECTION LOOP
-# ──────────────────────────────────────────────────────
-
-async def protection_loop(bot: Bot, chat_id: int, uid: int):
-    s = S(uid)
-    s["stop_requested"] = False
-    cycle = 1
-    log.info("Protection started uid=%s", uid)
-
-    try:
-        while not s["stop_requested"]:
-            codes = [c for c, v in list(s["vouchers"].items()) if not v.get("paused")]
-
-            if not codes:
-                await safe_send(
-                    bot, chat_id,
-                    "⚠️ No active codes to protect.\nAdd codes with /add or resume with /resume."
-                )
-                # Wait then retry
-                for _ in range(INTERVAL_SECONDS // 5):
-                    if s["stop_requested"]:
-                        break
-                    await asyncio.sleep(5)
-                continue
-
-            prog = await bot.send_message(
-                chat_id=chat_id,
-                text=f"🔄 *Cycle #{cycle}* — scanning {len(codes)} codes...",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-
-            alive, dead, errors = await run_scan(bot, chat_id, codes, progress_msg_id=prog.message_id)
-
-            # Build result summary — codes are NEVER auto-removed, only you can remove them
-            lines = [f"🔁 *Cycle #{cycle} done*\n"]
-            if alive:
-                lines.append(f"✅ *ALIVE ({len(alive)}):*")
-                for c in alive:
-                    lines.append(f"  • `{c}` — ₹{_voucher_value(c)}")
-            if dead:
-                lines.append(f"\n❌ *DEAD/USED ({len(dead)}):*")
-                for c in dead:
-                    lines.append(f"  • `{c}` — still rescanning next cycle")
-            if errors:
-                lines.append(f"\n⚠️ *Network error — retrying next cycle ({len(errors)}):*")
-                for c in errors:
-                    lines.append(f"  • `{c}`")
-
-            next_time = datetime.datetime.now() + datetime.timedelta(seconds=INTERVAL_SECONDS)
-            lines.append(f"\n⏰ Next scan: `{next_time.strftime('%H:%M:%S')}`")
-            lines.append(f"📦 Remaining: `{len(s['vouchers'])}` codes")
-
-            await safe_send(bot, chat_id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-            cycle += 1
-
-            # Wait in small chunks so stop responds quickly
-            for _ in range(INTERVAL_SECONDS // 5):
-                if s["stop_requested"]:
-                    break
-                await asyncio.sleep(5)
-
-    except asyncio.CancelledError:
-        pass  # silently exit — stop message is sent by cmd_stop
-    except Exception as e:
-        log.exception("Protection crashed uid=%s: %s", uid, e)
-        await safe_send(
-            bot, chat_id,
-            f"❌ Protection crashed:\n`{e}`\n\nRestart with /run",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    finally:
-        s["protect_task"] = None
-
-
-# ──────────────────────────────────────────────────────
-#  HELPER — extract codes from command message
-# ──────────────────────────────────────────────────────
-
-def _parse_codes(ctx, message_text: str) -> list:
-    args_part = " ".join(ctx.args) if ctx.args else ""
-    lines = message_text.split("\n")
-    extra = " ".join(lines[1:]) if len(lines) > 1 else ""
-    combined = (args_part + " " + extra).replace(",", " ")
-    return [c.strip().upper() for c in combined.split() if len(c.strip()) > 4]
-
-
-# ──────────────────────────────────────────────────────
-#  COMMANDS
-# ──────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🛡️ *SHEIN Voucher Bot*\n\n"
-        "*Commands:*\n"
-        "`/add <codes>` — add codes to protection list\n"
-        "`/protect <code>` — protect a single code instantly\n"
-        "`/check <codes>` — instant one-time check\n"
-        "`/run` — start full protection loop\n"
-        "`/stop` — stop protection loop\n"
-        "`/pause <code>` — skip a code during scans\n"
-        "`/resume <code>` — re-enable a paused code\n"
-        "`/list` — show all protected codes\n"
-        "`/clear` — remove all codes\n"
-        "`/status` — show bot status\n\n"
-        "⚡ *Speed:* 50 codes ≈ 75s · 60 codes ≈ 90s\n"
-        "🔁 *Full cycle:* scan + 3 min wait ≈ every 4.5 min",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-
-    codes = _parse_codes(ctx, update.message.text or "")
-    if not codes:
-        await update.message.reply_text(
-            "Usage: `/add CODE1 CODE2 CODE3`\nAlso works with one code per line.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    added, skipped = [], []
-    for code in codes:
-        if code not in s["vouchers"]:
-            s["vouchers"][code] = {"paused": False}
-            added.append(code)
-        else:
-            skipped.append(code)
-
-    msg = f"✅ Added *{len(added)}* codes"
-    if skipped:
-        msg += f", skipped *{len(skipped)}* duplicates"
-    msg += f"\n📦 Total protected: *{len(s['vouchers'])}*"
-    if added:
-        msg += "\n\n*Added:*\n" + "\n".join(f"  • `{c}`" for c in added)
-
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_protect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /protect CODE1 CODE2 ... — adds one or more codes and starts protection.
-    If protection is already running, codes are added to the existing loop.
-    """
-    uid = update.effective_user.id
-    s = S(uid)
-
-    codes = _parse_codes(ctx, update.message.text or "")
-    if not codes:
-        await update.message.reply_text(
-            "Usage: `/protect CODE1 CODE2 ...`\nExample: `/protect SVC1234ABCD SVH5678EFGH`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    added, skipped = [], []
-    for code in codes:
-        if code not in s["vouchers"]:
-            s["vouchers"][code] = {"paused": False}
-            added.append(code)
-        else:
-            skipped.append(code)
-
-    # If protection loop already running, just confirm the add
-    if s["protect_task"] and not s["protect_task"].done():
-        msg = f"✅ Added *{len(added)}* code(s) to the active protection loop"
-        if skipped:
-            msg += f", skipped *{len(skipped)}* already protected"
-        msg += f"\n📦 Total codes now: *{len(s['vouchers'])}*"
-        if added:
-            msg += "\n\n*Added:*\n" + "\n".join(f"  • `{c}`" for c in added)
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        return
-
-    # Start protection loop
-    s["protect_task"] = asyncio.create_task(
-        protection_loop(ctx.bot, update.effective_chat.id, uid)
-    )
-
-    active = sum(1 for v in s["vouchers"].values() if not v.get("paused"))
-    est_min = round(active * CODE_CHECK_DELAY / 60, 1)
-    cycle_min = round(est_min + INTERVAL_SECONDS / 60, 1)
-
-    msg = f"🛡️ *Protection started!*\n"
-    msg += f"📦 Protecting *{active}* code(s)\n"
-    msg += f"⚡ Scan time: ~*{est_min} min*\n"
-    msg += f"🔁 Full cycle every ~*{cycle_min} min*\n\n"
-    if added:
-        msg += "*Codes added:*\n" + "\n".join(f"  • `{c}`" for c in added) + "\n\n"
-    msg += "Use /stop to stop."
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-
-    if s["checking"]:
-        await update.message.reply_text("⚠️ A check is already running, please wait.")
-        return
-
-    codes = _parse_codes(ctx, update.message.text or "")
-    if not codes:
-        await update.message.reply_text(
-            "Usage: `/check CODE1 CODE2 CODE3`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    s["checking"] = True
-    prog = await update.message.reply_text(f"🔍 Checking {len(codes)} voucher(s)... Please wait.")
-
-    try:
-        alive, dead, errors = await run_scan(
-            ctx.bot, update.effective_chat.id, codes,
-            progress_msg_id=prog.message_id,
-        )
-    finally:
-        s["checking"] = False
-
-    lines = ["📊 *INSTANT CHECK RESULTS*\n"]
-
-    if alive:
-        lines.append(f"✅ *WORKING ({len(alive)}):*")
-        for c in alive:
-            lines.append(f"  `{c}` — ₹{_voucher_value(c)}")
-    else:
-        lines.append("✅ WORKING (0): None")
-
-    if dead:
-        lines.append(f"\n❌ *DEAD/USED ({len(dead)}):*")
-        for c in dead:
-            lines.append(f"  `{c}`")
-    else:
-        lines.append("\n❌ DEAD/USED (0): None")
-
-    if errors:
-        lines.append(f"\n⚠️ *Network error — try again ({len(errors)}):*")
-        for c in errors:
-            lines.append(f"  `{c}`")
-
-    result_text = "\n".join(lines)
-
-    if alive:
-        # Build one button per alive code to protect it individually
-        keyboard = []
-        for c in alive:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🔒 Protect {c}",
-                    callback_data=f"protect_one:{uid}:{c}"
-                )
-            ])
-        # Also offer a "protect all" button if more than one alive
-        if len(alive) > 1:
-            all_codes = ",".join(alive)
-            keyboard.insert(0, [
-                InlineKeyboardButton(
-                    f"🔒 Protect All {len(alive)} Working Codes",
-                    callback_data=f"protect_all:{uid}:{all_codes}"
-                )
-            ])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await ctx.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=result_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup,
-        )
-    else:
-        await safe_send(ctx.bot, update.effective_chat.id, result_text, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-
-    if not s["vouchers"]:
-        await update.message.reply_text("⚠️ No codes to protect. Use /add first.")
-        return
-
-    if s["protect_task"] and not s["protect_task"].done():
-        await update.message.reply_text("🛡️ Protection is already running! Use /stop first.")
-        return
-
-    s["protect_task"] = asyncio.create_task(
-        protection_loop(ctx.bot, update.effective_chat.id, uid)
-    )
-
-    active = sum(1 for v in s["vouchers"].values() if not v.get("paused"))
-    est_min = round(active * CODE_CHECK_DELAY / 60, 1)
-    cycle_min = round(est_min + INTERVAL_SECONDS / 60, 1)
-
-    await update.message.reply_text(
-        f"🚀 *Protection started!*\n"
-        f"📦 Protecting *{active}* codes\n"
-        f"⚡ Scan time: ~*{est_min} min*\n"
-        f"🔁 Full cycle every ~*{cycle_min} min*\n\n"
-        f"Use /stop to stop.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-
-    task = s.get("protect_task")
-    if task and not task.done():
-        s["stop_requested"] = True   # signal loop to exit cleanly
-        task.cancel()
-        s["protect_task"] = None
-        await update.message.reply_text("🛑 Protection stopped.")
-    else:
-        await update.message.reply_text("ℹ️ Protection is not currently running.")
-
-
-async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/pause CODE`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    code = ctx.args[0].upper()
-    if code not in s["vouchers"]:
-        await update.message.reply_text(
-            f"❌ `{code}` is not in the protection list.", parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    s["vouchers"][code]["paused"] = True
-    await update.message.reply_text(
-        f"⏸ `{code}` paused — will be skipped during scans.", parse_mode=ParseMode.MARKDOWN
-    )
-
-
-async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/resume CODE`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    code = ctx.args[0].upper()
-    if code not in s["vouchers"]:
-        s["vouchers"][code] = {"paused": False}
-        await update.message.reply_text(
-            f"✅ `{code}` added and now protected.", parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        s["vouchers"][code]["paused"] = False
-        await update.message.reply_text(f"▶️ `{code}` resumed.", parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-
-    if not s["vouchers"]:
-        await update.message.reply_text("📭 No codes in the list. Use /add to add some.")
-        return
-
-    lines = ["📋 *Protected Codes:*\n"]
-    for code, meta in s["vouchers"].items():
-        # Show paused vs protected — NOT "active" which confused with "working"
-        icon = "⏸" if meta.get("paused") else "🔒"
-        status = "paused" if meta.get("paused") else "protected"
-        val = _voucher_value(code)
-        lines.append(f"  {icon} `{code}` ₹{val} — {status}")
-
-    running = s.get("protect_task") and not s["protect_task"].done()
-    lines.append(f"\n🛡️ Protection: {'🟢 RUNNING' if running else '🔴 STOPPED'}")
-    lines.append(f"📦 Total: {len(s['vouchers'])} codes")
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-    count = len(s["vouchers"])
-    s["vouchers"].clear()
-    await update.message.reply_text(f"🗑️ Cleared all {count} codes.")
-
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = S(uid)
-
-    running = s.get("protect_task") and not s["protect_task"].done()
-    total = len(s["vouchers"])
-    active = sum(1 for v in s["vouchers"].values() if not v.get("paused"))
-
-    await update.message.reply_text(
-        f"📊 *Bot Status*\n\n"
-        f"🍪 Cookies: ✅ Loaded from cookies.json\n"
-        f"📦 Total codes: *{total}*\n"
-        f"🔒 Protected: *{active}*\n"
-        f"⏸ Paused: *{total - active}*\n"
-        f"🛡️ Protection: {'🟢 RUNNING' if running else '🔴 STOPPED'}\n"
-        f"⏱ Interval: *{INTERVAL_SECONDS // 60} min* between cycles",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def handle_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    If someone sends a raw message (not a command), treat it as codes to check instantly.
-    Filters out very short text so normal messages don't get checked by accident.
-    """
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-
-    # Extract potential codes (words longer than 4 chars, no spaces = likely a code)
-    potential = [w.upper() for w in text.replace(",", " ").split() if len(w) > 4]
-    if not potential:
-        return
-
-    uid = update.effective_user.id
-    s = S(uid)
-
-    if s["checking"]:
-        await update.message.reply_text("⚠️ A check is already running, please wait.")
-        return
-
-    s["checking"] = True
-    prog = await update.message.reply_text(f"🔍 Checking {len(potential)} voucher(s)... Please wait.")
-
-    try:
-        alive, dead, errors = await run_scan(
-            ctx.bot, update.effective_chat.id, potential,
-            progress_msg_id=prog.message_id,
-        )
-    finally:
-        s["checking"] = False
-
-    lines = ["📊 *INSTANT CHECK RESULTS*\n"]
-
-    if alive:
-        lines.append(f"✅ *WORKING ({len(alive)}):*")
-        for c in alive:
-            lines.append(f"  `{c}` — ₹{_voucher_value(c)}")
-    else:
-        lines.append("✅ WORKING (0): None")
-
-    if dead:
-        lines.append(f"\n❌ *DEAD/USED ({len(dead)}):*")
-        for c in dead:
-            lines.append(f"  `{c}`")
-    else:
-        lines.append("\n❌ DEAD/USED (0): None")
-
-    if errors:
-        lines.append(f"\n⚠️ *Network error — try again ({len(errors)}):*")
-        for c in errors:
-            lines.append(f"  `{c}`")
-
-    result_text = "\n".join(lines)
-
-    if alive:
-        keyboard = []
-        for c in alive:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🔒 Protect {c}",
-                    callback_data=f"protect_one:{uid}:{c}"
-                )
-            ])
-        if len(alive) > 1:
-            all_codes = ",".join(alive)
-            keyboard.insert(0, [
-                InlineKeyboardButton(
-                    f"🔒 Protect All {len(alive)} Working Codes",
-                    callback_data=f"protect_all:{uid}:{all_codes}"
-                )
-            ])
-        await ctx.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=result_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-    else:
-        await safe_send(ctx.bot, update.effective_chat.id, result_text, parse_mode=ParseMode.MARKDOWN)
-
-
-# ──────────────────────────────────────────────────────
-#  CALLBACK — inline button handler for protect buttons
-# ──────────────────────────────────────────────────────
-
-async def callback_protect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handles the inline 🔒 Protect button taps from /check results."""
-    query = update.callback_query
-    await query.answer()  # remove the loading spinner
-
-    data = query.data  # e.g. "protect_one:12345:SVC1234" or "protect_all:12345:SVC1,SVH2"
-    parts = data.split(":", 2)
-    if len(parts) < 3:
-        return
-
-    action, uid_str, codes_str = parts
-    uid = int(uid_str)
-    s = S(uid)
-
-    codes_to_add = [c.strip().upper() for c in codes_str.split(",") if c.strip()]
-
-    added, skipped = [], []
-    for code in codes_to_add:
-        if code not in s["vouchers"]:
-            s["vouchers"][code] = {"paused": False}
-            added.append(code)
-        else:
-            skipped.append(code)
-
-    # Start protection loop if not already running
-    loop_started = False
-    if s["protect_task"] is None or s["protect_task"].done():
-        s["protect_task"] = asyncio.create_task(
-            protection_loop(ctx.bot, query.message.chat_id, uid)
-        )
-        loop_started = True
-
-    if len(codes_to_add) == 1:
-        code = codes_to_add[0]
-        if skipped:
-            msg = f"🔒 `{code}` is already being protected."
-        else:
-            msg = f"🛡️ `{code}` added to protection!"
-            if loop_started:
-                msg += f"\n🚀 Protection loop started."
-    else:
-        msg = f"🛡️ *{len(added)}* code(s) added to protection!"
-        if skipped:
-            msg += f" ({len(skipped)} already protected)"
-        if loop_started:
-            msg += f"\n🚀 Protection loop started."
-
-    msg += f"\n📦 Total protected: *{len(s['vouchers'])}*"
-
-    # Edit the original message to remove the buttons (avoid double-tapping)
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    await ctx.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=msg,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-# ──────────────────────────────────────────────────────
-#  ERROR HANDLER
-# ──────────────────────────────────────────────────────
-
-async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    log.error("Unhandled error: %s", ctx.error, exc_info=ctx.error)
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                f"⚠️ Something went wrong:\n`{ctx.error}`\n\nBot is still running.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=final_text)
         except Exception:
-            pass
+            await bot.send_message(chat_id=chat_id, text=final_text)
+    else:
+        # Too long: put summary in the progress-message slot, chunk results below
+        summary_only = build_final_message([], valid, invalid, errors, total)
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=summary_only)
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=summary_only)
 
+        # Send result lines chunked into ≤4096-char messages
+        chunk = ""
+        for line in result_lines:
+            candidate = (chunk + "\n" + line).strip()
+            if len(candidate) > MAX_TG:
+                await bot.send_message(chat_id=chat_id, text=chunk)
+                await asyncio.sleep(0.5)
+                chunk = line
+            else:
+                chunk = candidate
+        if chunk:
+            await bot.send_message(chat_id=chat_id, text=chunk)
 
-# ──────────────────────────────────────────────────────
-#  MAIN
-# ──────────────────────────────────────────────────────
+# ===================== TELEGRAM HANDLERS =====================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Welcome to the SHEIN Voucher Checker Bot!\n\n"
+        "Send me voucher codes (starting with SV) and I'll check them live.\n"
+        "Use /protect CODE to add codes to auto-check every 4 minutes (your list only)."
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle plain messages containing voucher codes."""
+    text = update.message.text or ""
+    codes = get_codes_from_text(text)
+
+    if not codes:
+        await update.message.reply_text("⚠️ No voucher codes found. Send codes starting with SV...")
+        return
+
+    await update.message.reply_text(f"🚀 {len(codes)} code(s) received. Starting cycle...")
+    await run_cycle(codes, update.effective_chat.id, context)
+
+async def protect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/protect CODE — adds a voucher code to THIS user's private protection list."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /protect SVI5GTC0C1PES9F")
+        return
+
+    user_id  = update.effective_user.id
+    chat_id  = update.effective_chat.id
+
+    added = []
+    with protect_lock:
+        user_list = protected_codes.setdefault(user_id, [])
+        for arg in args:
+            for code in get_codes_from_text(arg):
+                if code not in user_list:
+                    user_list.append(code)
+                    added.append(code)
+
+    if added:
+        await update.message.reply_text(
+            "🛡 Code(s) added to your protection list:\n" + "\n".join(added)
+        )
+        # Schedule a per-user auto-check job (once per user, keyed by user_id)
+        with _scheduled_lock:
+            if user_id not in _scheduled_chats:
+                _scheduled_chats.add(user_id)
+                context.job_queue.run_repeating(
+                    protected_codes_job,
+                    interval=CHECK_INTERVAL,
+                    first=CHECK_INTERVAL,
+                    chat_id=chat_id,          # where to send results
+                    user_id=user_id,          # whose codes to check
+                    name=f"protect_{user_id}",
+                )
+                await update.message.reply_text(
+                    f"⏱ Auto-check scheduled every {CHECK_INTERVAL}s for your codes."
+                )
+    else:
+        await update.message.reply_text("⚠️ No new valid SV... codes found in your arguments.")
+
+# ===================== PROTECTED CODES AUTO-CHECKER =====================
+async def protected_codes_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Periodically checks the protected codes belonging to the specific user
+    who scheduled this job.  Each user's job is completely independent.
+    """
+    user_id = context.job.user_id   # set when job was registered
+    chat_id = context.job.chat_id
+
+    with protect_lock:
+        codes = list(protected_codes.get(user_id, []))
+
+    if not codes:
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🔁 Auto-checking {len(codes)} of your protected code(s)...",
+    )
+    await run_cycle(codes, chat_id, context)
+
+# ===================== MAIN =====================
+async def post_init(application: Application):
+    pass  # reserved for future startup tasks
 
 def main():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Please set your BOT_TOKEN at the top of the script.")
-        sys.exit(1)
-
     app = (
-        ApplicationBuilder()
+        Application.builder()
         .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .pool_timeout(30)
+        .post_init(post_init)
         .build()
     )
 
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("add",     cmd_add))
-    app.add_handler(CommandHandler("protect", cmd_protect))
-    app.add_handler(CommandHandler("check",   cmd_check))
-    app.add_handler(CommandHandler("run",     cmd_run))
-    app.add_handler(CommandHandler("stop",    cmd_stop))
-    app.add_handler(CommandHandler("pause",   cmd_pause))
-    app.add_handler(CommandHandler("resume",  cmd_resume))
-    app.add_handler(CommandHandler("list",    cmd_list))
-    app.add_handler(CommandHandler("clear",   cmd_clear))
-    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("protect", protect_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Inline button callbacks
-    app.add_handler(CallbackQueryHandler(callback_protect, pattern=r"^protect_(one|all):"))
-
-    # Handle plain text messages as instant voucher checks
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
-
-    app.add_error_handler(error_handler)
-
-    print("====================================================")
-    print("🛡️  SHEIN Voucher Bot is running...")
-    print("🍪  Cookies loaded from cookies.json")
-    print("====================================================")
-
-    app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
-
+    print("Bot started successfully.")
+    print("Loaded cookies and proxies (if available).")
+    print("Auto-check system running. Waiting for commands...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
