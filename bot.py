@@ -22,7 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")  # <-- Replace with your Telegram bot token
 MAX_WORKERS = 8          # Number of vouchers to check at once
 THREAD_DELAY = 0.3       # Delay between starting threads
 RETRY_DELAY = 0.5        # Delay before retrying a failed request
-CHECK_INTERVAL = 240     # Seconds between cycles (auto-protect loop — 4 minutes)
+CHECK_INTERVAL = 120     # Seconds between cycles (auto-protect loop — 4 minutes)
 
 # Thread locks
 proxy_lock = threading.Lock()
@@ -427,6 +427,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
